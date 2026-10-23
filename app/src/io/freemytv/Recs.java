@@ -60,7 +60,7 @@ final class Recs {
     private static final int ANIMATION = 16;
     private static final long LIST_EVERY = 6 * 3600_000L;
     /** Bump when what is saved for each title changes (the saved list is discarded and fetched again). */
-    private static final int CACHE_VERSION = 5;
+    private static final int CACHE_VERSION = 6;
     private static final int MANHA = 0, TARDE = 1, NOITE = 2;
     /** Service name on TMDB (part of the name, lowercase) → TV app (HomeApps key, package). */
     private static final String[][] SERVICES = {
@@ -132,8 +132,6 @@ final class Recs {
     private volatile boolean fetching;
     private volatile String error = "";
     private volatile boolean light;     // light design: builds only the cards (all three tabs' cards fit in memory)
-    private volatile String activeApp;
-    private volatile int activeStart;
     private volatile long failedAt, keyStamp, linkRetryAt;
     private volatile String listLanguage = "";   // language used for the saved titles, genres and texts
     private volatile boolean refreshAgain;
@@ -211,29 +209,15 @@ final class Recs {
 
     /** This hour's 3, movies only ("movie") or shows only ("tv"); null = both (the home screen tabs). */
     List<Pick> now(String kind) {
-        return select(kind, null);
+        return select(kind);
     }
 
-    /** Up to nine picks for one app on the shelf; null when the service has no TMDB catalogue in this region. */
-    List<Pick> nowForApp(String appKey) {
-        return select(null, appKey);
-    }
-
-    /** Set the shelf app and visible card window whose recommendations are on screen. */
-    boolean setActiveView(String appKey, int start) {
-        start = Math.max(0, start);
-        if (java.util.Objects.equals(activeApp, appKey) && activeStart == start) return false;
-        activeApp = appKey;
-        activeStart = start;
-        return true;
-    }
-
-    private List<Pick> select(String kind, String appKey) {
+    private List<Pick> select(String kind) {
         List<Pick> list = new ArrayList<>();
         if (!hasKey(context)) return list;    // no TMDB key: no recommendations
         Map<String, Boolean> have = new HashMap<>();   // one look per app, not per title (this runs every 15 s)
         for (Pick p : picks) {
-            if ((kind == null || kind.equals(p.kind)) && (appKey == null || appKey.equals(p.app))
+            if ((kind == null || kind.equals(p.kind))
                     && (!p.detailed || (p.pkg != null && have.computeIfAbsent(p.pkg, this::installedForDisplay)))) list.add(p);   // app missing: skip
         }
         if (list.isEmpty()) return list;
@@ -241,8 +225,7 @@ final class Recs {
         // Three per hour, never two from the same franchise ("Law & Order" and "Law & Order: Special…").
         List<Pick> out = new ArrayList<>();
         java.util.Set<String> seen = new java.util.HashSet<>();
-        int limit = appKey == null ? 3 : 9;
-        for (int i = 0; i < list.size() && out.size() < limit; i++) {
+        for (int i = 0; i < list.size() && out.size() < 3; i++) {
             Pick p = list.get((int) ((hour * 3 + i) % list.size()));
             if (seen.add(franchise(p.title))) out.add(p);
         }
@@ -443,13 +426,6 @@ final class Recs {
         for (String kind : new String[] {null, "movie", "tv"}) {
             for (Pick p : now(kind)) if (seen.add(key(p) + ":" + p.app)) out.add(p);
         }
-        if (activeApp != null) {
-            List<Pick> appPicks = nowForApp(activeApp);
-            for (int i = activeStart; i < Math.min(appPicks.size(), activeStart + 3); i++) {
-                Pick p = appPicks.get(i);
-                if (seen.add(key(p) + ":" + p.app)) out.add(p);
-            }
-        }
         return out;
     }
 
@@ -519,40 +495,6 @@ final class Recs {
         java.util.Set<String> seen = new java.util.HashSet<>();
         alternate(list, seen, hotMovies, hotShows, 24);
         alternate(list, seen, newMovies, newShows, 24);
-        // Keep three app-specific picks for every recognized, installed shelf service. Querying each provider
-        // separately ensures an item shared by several services is attributed to the app the viewer selected.
-        for (Map.Entry<Integer, String[]> entry : services.entrySet()) {
-            int providerId = entry.getKey();
-            String[] service = entry.getValue();
-            String providerFilter = "&language=" + lang() + "&watch_region=" + REGION
-                    + "&with_watch_monetization_types=flatrate|free|ads&include_adult=false&sort_by=popularity.desc"
-                    + "&with_watch_providers=" + providerId
-                    + (Config.HIDE_ANIMATION ? "&without_genres=" + ANIMATION : "");
-            for (String kind : new String[] {"movie", "tv"}) {
-                String dateKey = kind.equals("movie") ? "primary_release_date" : "air_date";
-                int days = kind.equals("movie") ? -365 : -90;
-                String path = kind.equals("movie") ? "/discover/movie?vote_count.gte=10&" : "/discover/tv?vote_count.gte=10&";
-                JSONArray results = get(path + dateKey + ".gte=" + day(days) + "&" + dateKey + ".lte=" + day(0)
-                        + providerFilter).getJSONArray("results");
-                int added = 0;
-                for (int i = 0; i < results.length() && added < 5; i++) {
-                    JSONObject result = results.getJSONObject(i);
-                    String key = kind + ":" + result.optInt("id");
-                    String appPickKey = key + ":" + service[1];
-                    if (seen.contains(appPickKey)) continue;
-                    List<Pick> one = new ArrayList<>();
-                    add(one, result, kind);
-                    if (one.isEmpty()) continue;
-                    Pick pick = one.get(0);
-                    pick.app = service[1];
-                    pick.appName = service.length > 3 ? service[3] : SERVICE_NAME.get(service[1]);
-                    pick.pkg = service[2];
-                    list.add(pick);
-                    seen.add(appPickKey);
-                    added++;
-                }
-            }
-        }
         if (list.isEmpty()) throw new IOException("TMDB returned no recommendations");
         picks = list;
         period = p;

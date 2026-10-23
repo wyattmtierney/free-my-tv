@@ -2873,23 +2873,16 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
 
     /** The three cards of the current tab (Explore, Movies, Shows) and the background taken from the first one. */
     private void updateCards() {
-        String appKey = tab == 0 && shelfIndex >= 0 && shelfIndex < shelf.size()
-                && shelf.get(shelfIndex).kind == HomeApps.APP ? shelf.get(shelfIndex).key : null;
-        String source = tab + ":" + (appKey == null ? "" : appKey);
+        String source = Integer.toString(tab);
         if (!source.equals(cardsSource)) {
             cardsSource = source;
             cardIndex = 0;
         }
-        if (recs.setActiveView(appKey, cardStart())) recs.refreshIfStale();
-        List<Recs.Pick> list;
-        if (appKey != null)
-            list = recs.nowForApp(appKey);
-        else list = recs.now(TAB_KIND[tab]);
+        List<Recs.Pick> list = recs.now(TAB_KIND[tab]);
         boolean changed = !samePicks(list, cards);
         if (changed) {
             cards = list;
             cardIndex = Math.min(cardIndex, Math.max(0, list.size() - 1));
-            if (recs.setActiveView(appKey, cardStart())) recs.refreshIfStale();
             if (zone == Z_CARDS && list.isEmpty()) {
                 zone = Z_SHELF;
                 retarget(false);
