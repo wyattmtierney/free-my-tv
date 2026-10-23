@@ -4,6 +4,7 @@ import android.graphics.Bitmap;
 import android.graphics.BitmapShader;
 import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.Matrix;
 import android.graphics.Paint;
 import android.graphics.RectF;
 import android.graphics.RuntimeShader;
@@ -14,8 +15,8 @@ import android.graphics.Shader;
  * and only redrawn when it moves (advance, up to ~30 times per second); in the frames between steps the GPU just
  * reuses the layer. The glass reads the frosted aurora computed in Frost or, with a recommendation's image as the
  * background, its blurred version (setFrost).
- * If AGSL fails (it shouldn't on Android 13+), it falls back to a gradient and plain translucent glass: the home screen
- * is never left blank.
+ * On Android 8 to 12, CPU-generated frosted pixels and translucent highlight layers preserve the glass treatment without
+ * AGSL. If either renderer fails, the home screen falls back to a gradient and translucent panels.
  */
 final class Scene {
     final Shaders.Palette palette = new Shaders.Palette();
@@ -27,6 +28,8 @@ final class Scene {
     private final Paint flatFill = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint flatRim = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint fallback = new Paint();
+    private final Paint compatGlassPaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
+    private final Matrix compatGlassMatrix = new Matrix();
     private final Recording auroraNode = Recording.create("aurora");
     // The layer is drawn at a quarter size and scaled up: filtered, its soft shapes stay soft instead of stepping.
     private final Paint layerPaint = new Paint(Paint.FILTER_BITMAP_FLAG);
@@ -35,6 +38,7 @@ final class Scene {
     private boolean auroraDirty = true, imageFrost, imageGlass;
     private Bitmap frostImage, glassA, glassB;
     private BitmapShader glassShaderA;
+    private BitmapShader compatFrost, compatBackdrop;
     private final boolean withGlass;
 
     Scene() {
@@ -92,7 +96,10 @@ final class Scene {
 
     private void push() {
         dim = Math.min(0.6f, baseDim + Math.max(0, Math.min(0.22f, (palette.brightest() - 0.45f) * 0.5f)));
-        if (aurora == null) return;
+        if (aurora == null) {
+            if (withGlass) compatFrost = frost.render(time, speed, dim, palette.c, (float) w / h);
+            return;
+        }
         aurora.setFloatUniform("speed", speed);
         aurora.setFloatUniform("dim", dim);
         palette.apply(aurora);
@@ -102,7 +109,10 @@ final class Scene {
     /** Moves the aurora to `seconds`: redraws the layer on the next draw, recomputes the glass's frosted aurora now. */
     void advance(float seconds) {
         time = seconds;
-        if (aurora == null) return;
+        if (aurora == null) {
+            if (withGlass) compatFrost = frost.render(seconds, speed, dim, palette.c, (float) w / h);
+            return;
+        }
         aurora.setFloatUniform("t", seconds);
         if (withGlass && (!imageFrost || !imageGlass)) {
             BitmapShader s = frost.render(seconds, speed, dim, palette.c, (float) w / h);
@@ -125,9 +135,12 @@ final class Scene {
     /** Photo transition: both photos in the glass, blended by setGlassMix (0 = the first one). */
     void setGlassImages(int[] from, int[] to) {
         imageGlass = true;
-        if (liquid == null) return;     // no AGSL (Android 8 to 12): the glass is a flat fill, nothing reads the images
         glassA = fill(glassA, from);
         if (to != null) glassB = fill(glassB, to);
+        if (liquid == null) {
+            updateCompatBackdrop();
+            return;
+        }
         glassShaderA = linear(glassA);
         liquid.setInputShader("imageA", glassShaderA);
         liquid.setInputShader("imageB", to != null ? linear(glassB) : glassShaderA);
@@ -136,6 +149,8 @@ final class Scene {
     }
 
     void setGlassMix(float t) {
+        if (liquid == null && glassB != null) compatBackdrop = new BitmapShader(t < 0.5f ? glassA : glassB,
+                Shader.TileMode.CLAMP, Shader.TileMode.CLAMP);
         if (liquid != null) liquid.setFloatUniform("mixB", Math.max(0, Math.min(1, t)));
     }
 
@@ -143,6 +158,7 @@ final class Scene {
     void clearGlass() {
         if (!imageGlass) return;
         imageGlass = false;
+        if (glass == null) updateCompatBackdrop();
         advance(time);
     }
 
@@ -185,9 +201,12 @@ final class Scene {
     /** The glass now reads the blurred background image (Backdrop.FW × FH, ARGB). */
     void setFrost(int[] pixels) {
         imageFrost = true;
-        if (glass == null) return;      // as above: no shader reads the frosted image
         if (frostImage == null) frostImage = Bitmap.createBitmap(Backdrop.FW, Backdrop.FH, Bitmap.Config.ARGB_8888);
         frostImage.setPixels(pixels, 0, Backdrop.FW, 0, 0, Backdrop.FW, Backdrop.FH);
+        if (glass == null) {
+            updateCompatBackdrop();
+            return;
+        }
         BitmapShader s = new BitmapShader(frostImage, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP);
         s.setFilterMode(BitmapShader.FILTER_MODE_LINEAR);
         glass.setInputShader("frost", s);
@@ -198,6 +217,7 @@ final class Scene {
     void clearFrost() {
         if (!imageFrost) return;
         imageFrost = false;
+        if (glass == null) updateCompatBackdrop();
         setFrostScale();
         advance(time);
     }
@@ -217,6 +237,11 @@ final class Scene {
         if (glass == null) return;
         if (imageFrost) glass.setFloatUniform("frostScale", (float) Backdrop.FW / w, (float) Backdrop.FH / h);
         else glass.setFloatUniform("frostScale", (float) Frost.W / w, (float) Frost.H / h);
+    }
+
+    private void updateCompatBackdrop() {
+        Bitmap b = imageGlass && glassA != null ? glassA : imageFrost ? frostImage : null;
+        compatBackdrop = b == null ? null : new BitmapShader(b, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP);
     }
 
     void drawBackground(Canvas c) {
@@ -252,8 +277,19 @@ final class Scene {
     void glass(Canvas c, RectF r, float radius, int tint, float tintAlpha, int glow, float glowAlpha, float lift, float body, float alpha) {
         if (alpha <= 0.004f) return;
         if (glass == null) {
+            BitmapShader source = compatBackdrop != null ? compatBackdrop : compatFrost;
+            if (source != null) {
+                Bitmap bitmap = imageGlass && glassA != null ? glassA : imageFrost ? frostImage : null;
+                int sw = bitmap != null ? bitmap.getWidth() : Frost.W;
+                int sh = bitmap != null ? bitmap.getHeight() : Frost.H;
+                compatGlassMatrix.setScale((float) w / sw, (float) h / sh);
+                source.setLocalMatrix(compatGlassMatrix);
+                compatGlassPaint.setShader(source);
+                c.drawRoundRect(r, radius, radius, compatGlassPaint);
+                compatGlassPaint.setShader(null);
+            }
             if (body > 0) {
-                flatFill.setColor(Ui.alpha(tint | 0xFF000000, Math.max(0.35f, tintAlpha)));
+                flatFill.setColor(Ui.alpha(tint | 0xFF000000, Math.max(0.15f, tintAlpha * 0.38f)));
                 c.drawRoundRect(r, radius, radius, flatFill);
             }
             c.drawRoundRect(r, radius, radius, flatRim);

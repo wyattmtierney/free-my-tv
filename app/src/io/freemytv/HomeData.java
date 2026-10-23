@@ -416,7 +416,8 @@ final class HomeData {
     /** Celsius or Fahrenheit (config.properties "temperature": C, F, or auto = Fahrenheit in the US). */
     static String degrees(double v) {
         if (Double.isNaN(v)) return "—";
-        return Math.round(fahrenheit() ? v * 9 / 5 + 32 : v) + "°";
+        boolean f = fahrenheit();
+        return Math.round(f ? v * 9 / 5 + 32 : v) + (f ? "°F" : "°C");
     }
 
     private static boolean fahrenheit() {

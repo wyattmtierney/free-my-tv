@@ -81,18 +81,11 @@ final class HomeApps {
      */
     private static final String[][] SHELF = {
         {"netflix", "Netflix", "com.netflix.ninja", "E50914", "", "1"},
-        {"youtube", "YouTube", "com.google.android.youtube.tv", "FF0033", "play", "1"},
-        {"prime", "Prime Video", "com.amazon.amazonvideo.livingroom", "1A98FF", "tint", "0.96"},
+        {"crave", "Crave", "ca.bellmedia.cravetv", "5A2A82", "", "1"},
         {"disney", "Disney+", "com.disney.disneyplus", "1838C8", "", "1"},
-        {"max", "Max", "com.wbd.stream", "6C3BE0", "", "1.32"},
-        {"max", "HBO Max", "com.hbo.hbonow", "6C3BE0", "", "1.32"},
-        {"appletv", "Apple TV", "com.apple.atve.androidtv.appletv", "B8BCC6", "", "1.1"},
-        {"appletv", "Apple TV", "com.apple.atve.sony.appletv", "B8BCC6", "", "1.1"},   // Sony's own build
-        {"hulu", "Hulu", "com.hulu.livingroomplus", "1CE783", "", "1"},
-        {"paramount", "Paramount+", "com.cbs.ott", "0064FF", "", "1"},
-        {"peacock", "Peacock", "com.peacocktv.peacockandroid", "6E55DC", "", "1"},
-        {"globoplay", "Globoplay", "com.globo.globotv", "FF5A1F", "tint", "1"},
-        {"spotify", "Spotify", "com.spotify.tv.android", "1DB954", "", "1"},
+        {"prime", "Prime Video", "com.amazon.amazonvideo.livingroom", "1A98FF", "tint", "0.96"},
+        {"youtube", "YouTube", "com.google.android.youtube.tv", "FF0033", "play", "1"},
+        {"tubi", "Tubi", "com.tubitv", "F4D322", "", "1"},
     };
     static final int MAX_SHELF = 8;
     /** Live TV apps of some brands (the antenna's channels open through the standard Android request first). */
@@ -159,10 +152,23 @@ final class HomeApps {
         return null;
     }
 
+
     /** The shelf's packages in order: the user's list (Settings > Shelf), or the built-in one. */
     static List<String> shelfPackages(Context c) {
         List<String> custom = Prefs.shelf();
-        if (custom != null) return custom;
+        if (custom != null) {
+            // The owner explicitly chose this six-app Canadian shelf. If an older saved shelf still has extra apps
+            // (the photo showed Apple TV after Tubi), restore the requested services and order once the full set exists.
+            boolean hasRequestedSet = true;
+            for (String[] item : SHELF) if (!custom.contains(item[2])) hasRequestedSet = false;
+            if (hasRequestedSet) {
+                List<String> requested = new ArrayList<>();
+                for (String[] item : SHELF) requested.add(item[2]);
+                if (!custom.equals(requested)) Prefs.setShelf(requested);
+                return requested;
+            }
+            return custom;
+        }
         List<String> out = new ArrayList<>();
         PackageManager pm = c.getPackageManager();
         for (String[] d : SHELF) if (out.size() < MAX_SHELF && launchIntent(pm, d[2]) != null) out.add(d[2]);

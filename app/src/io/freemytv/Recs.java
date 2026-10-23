@@ -45,7 +45,7 @@ final class Recs {
     static final class Pick {
         int id;
         String kind;            // "movie" or "tv"
-        String title, backdrop, meta = "", app, pkg;
+        String title, backdrop, meta = "", app, appName, pkg;
         String link;            // opens the title in its app (looked up with Watchmode), or null: the app's home
         boolean detailed;
     }
@@ -59,13 +59,16 @@ final class Recs {
     private static final int ANIMATION = 16;
     private static final long LIST_EVERY = 6 * 3600_000L;
     /** Bump when what is saved for each title changes (the saved list is discarded and fetched again). */
-    private static final int CACHE_VERSION = 3;
+    private static final int CACHE_VERSION = 5;
     private static final int MANHA = 0, TARDE = 1, NOITE = 2;
     /** Service name on TMDB (part of the name, lowercase) → TV app (HomeApps key, package). */
     private static final String[][] SERVICES = {
         {"netflix", "netflix", "com.netflix.ninja"},
         {"prime video", "prime", "com.amazon.amazonvideo.livingroom"},
         {"disney", "disney", "com.disney.disneyplus"},
+        {"crave", "crave", "ca.bellmedia.cravetv"},
+        {"tubi", "tubi", "com.tubitv"},
+        {"youtube", "youtube", "com.google.android.youtube.tv"},
         {"hulu", "hulu", "com.hulu.livingroomplus"},
         {"paramount", "paramount", "com.cbs.ott"},
         {"peacock", "peacock", "com.peacocktv.peacockandroid"},
@@ -84,6 +87,9 @@ final class Recs {
         SERVICE_NAME.put("netflix", "Netflix");
         SERVICE_NAME.put("prime", "Prime Video");
         SERVICE_NAME.put("disney", "Disney+");
+        SERVICE_NAME.put("crave", "Crave");
+        SERVICE_NAME.put("tubi", "Tubi");
+        SERVICE_NAME.put("youtube", "YouTube");
         SERVICE_NAME.put("hulu", "Hulu");
         SERVICE_NAME.put("paramount", "Paramount+");
         SERVICE_NAME.put("peacock", "Peacock");
@@ -111,23 +117,31 @@ final class Recs {
     private final Context context;
     private final SharedPreferences cache;
     private final ExecutorService io = Executors.newSingleThreadExecutor();
+    private final ExecutorService imageIo = Executors.newSingleThreadExecutor();
     private final Handler main = new Handler(Looper.getMainLooper());
     private final List<Listener> listeners = new ArrayList<>();
-    private final Map<String, Backdrop> images = new LinkedHashMap<>();   // this hour's, built and ready to draw
+    private final Map<String, Backdrop> images = new LinkedHashMap<>(16, 0.75f, true);   // access-ordered; visible art stays warm
     private final java.util.Set<String> pending = new java.util.HashSet<>();
+    private final Map<String, Object> downloadLocks = new HashMap<>();
+    /** Package-manager lookups are refreshed by sourceStamp() on the IO executor, never during card selection. */
+    private final Map<String, Boolean> installedSnapshot = new java.util.concurrent.ConcurrentHashMap<>();
     private volatile List<Pick> picks = new ArrayList<>();
     private volatile int period = -1;
     private volatile long listAt;
     private volatile boolean fetching;
     private volatile String error = "";
     private volatile boolean light;     // light design: builds only the cards (all three tabs' cards fit in memory)
+    private volatile String activeApp;
+    private volatile int activeStart;
     private volatile long failedAt, keyStamp, linkRetryAt;
     private volatile String listLanguage = "";   // language used for the saved titles, genres and texts
+    private volatile boolean refreshAgain;
 
     private Recs(Context c) {
         context = c;
         cache = c.getSharedPreferences("recs", Context.MODE_PRIVATE);
-        if (cache.getInt("version", 0) != CACHE_VERSION) cache.edit().clear().putInt("version", CACHE_VERSION).apply();
+        if (cache.getInt("version", 0) != CACHE_VERSION)
+            cache.edit().putInt("version", CACHE_VERSION).putLong("listAt", 0).apply();
         try {
             String saved = cache.getString("picks", null);
             if (saved != null) picks = parse(new JSONArray(saved));
@@ -186,19 +200,38 @@ final class Recs {
 
     /** This hour's 3, movies only ("movie") or shows only ("tv"); null = both (the home screen tabs). */
     List<Pick> now(String kind) {
+        return select(kind, null);
+    }
+
+    /** Up to nine picks for one app on the shelf; null when the service has no TMDB catalogue in this region. */
+    List<Pick> nowForApp(String appKey) {
+        return select(null, appKey);
+    }
+
+    /** Set the shelf app and visible card window whose recommendations are on screen. */
+    boolean setActiveView(String appKey, int start) {
+        start = Math.max(0, start);
+        if (java.util.Objects.equals(activeApp, appKey) && activeStart == start) return false;
+        activeApp = appKey;
+        activeStart = start;
+        return true;
+    }
+
+    private List<Pick> select(String kind, String appKey) {
         List<Pick> list = new ArrayList<>();
         if (!hasKey(context)) return list;    // no TMDB key: no recommendations
         Map<String, Boolean> have = new HashMap<>();   // one look per app, not per title (this runs every 15 s)
         for (Pick p : picks) {
-            if ((kind == null || kind.equals(p.kind))
-                    && (!p.detailed || (p.pkg != null && have.computeIfAbsent(p.pkg, this::installed)))) list.add(p);   // app missing: skip
+            if ((kind == null || kind.equals(p.kind)) && (appKey == null || appKey.equals(p.app))
+                    && (!p.detailed || (p.pkg != null && have.computeIfAbsent(p.pkg, this::installedForDisplay)))) list.add(p);   // app missing: skip
         }
         if (list.isEmpty()) return list;
         long hour = System.currentTimeMillis() / 3600_000L;
         // Three per hour, never two from the same franchise ("Law & Order" and "Law & Order: Special…").
         List<Pick> out = new ArrayList<>();
         java.util.Set<String> seen = new java.util.HashSet<>();
-        for (int i = 0; i < list.size() && out.size() < 3; i++) {
+        int limit = appKey == null ? 3 : 9;
+        for (int i = 0; i < list.size() && out.size() < limit; i++) {
             Pick p = list.get((int) ((hour * 3 + i) % list.size()));
             if (seen.add(franchise(p.title))) out.add(p);
         }
@@ -215,7 +248,8 @@ final class Recs {
 
     /** Name of the service the pick is on ("Netflix"), or empty. */
     static String serviceName(Pick p) {
-        return p == null || p.app == null ? "" : SERVICE_NAME.get(p.app);
+        return p == null || p.app == null ? "" : SERVICE_NAME.containsKey(p.app) ? SERVICE_NAME.get(p.app)
+                : p.appName == null ? p.app : p.appName;
     }
 
     /** The pick's ready backdrop (or null: builds it in the background and notifies when it's ready). */
@@ -227,9 +261,20 @@ final class Recs {
             if (b != null) return b;
             if (!pending.add(key)) return null;
         }
-        io.execute(() -> {
+        Pick snapshot = new Pick();
+        snapshot.id = p.id;
+        snapshot.kind = p.kind;
+        snapshot.title = p.title;
+        snapshot.backdrop = key;
+        snapshot.meta = p.meta;
+        snapshot.app = p.app;
+        snapshot.appName = p.appName;
+        snapshot.pkg = p.pkg;
+        snapshot.link = p.link;
+        snapshot.detailed = p.detailed;
+        imageIo.execute(() -> {
             try {
-                loadImage(p);
+                loadImage(snapshot);
             } finally {
                 synchronized (images) { pending.remove(key); }
             }
@@ -247,22 +292,30 @@ final class Recs {
 
     /** With a key: fetches the list if stale or the time of day (morning/afternoon/night) changed; then the details. */
     void refreshIfStale() {
-        if (!hasKey(context) || fetching) return;
-        long now = System.currentTimeMillis();
-        long stamp = sourceStamp();   // a new key, country, animation choice or installed streaming-app set refetches
-        boolean newKey = stamp != keyStamp;
-        long sinceFail = now - failedAt;    // negative = the clock went back: don't wait
-        if (!newKey && failedAt != 0 && sinceFail >= 0 && sinceFail < 10 * 60_000L) return;
-        int p = period(now);
-        boolean stale = newKey || p != period || now - listAt > LIST_EVERY || now < listAt || picks.isEmpty()
-                || !listLanguage.equals(Ui.language);
-        boolean missing = false;
-        for (Pick pick : wanted()) missing |= !pick.detailed || !hasImage(pick) || needsLink(pick);
-        if (!stale && !missing) return;
-        keyStamp = stamp;
-        fetching = true;
+        if (!hasKey(context)) return;
+        synchronized (this) {
+            if (fetching) {
+                refreshAgain = true;
+                return;
+            }
+            fetching = true;
+        }
         io.execute(() -> {
+            boolean notify = false;
             try {
+                long now = System.currentTimeMillis();
+                long stamp = sourceStamp();   // package queries and disk checks belong off the UI thread
+                boolean newKey = stamp != keyStamp;
+                long sinceFail = now - failedAt;
+                if (!newKey && failedAt != 0 && sinceFail >= 0 && sinceFail < 10 * 60_000L) return;
+                int p = period(now);
+                boolean stale = newKey || p != period || now - listAt > LIST_EVERY || now < listAt || picks.isEmpty()
+                        || !listLanguage.equals(Ui.language);
+                boolean missing = false;
+                for (Pick pick : wanted()) missing |= !pick.detailed || !hasImage(pick) || needsLink(pick);
+                if (!stale && !missing) return;
+                keyStamp = stamp;
+                notify = true;
                 if (stale) fetchList(p);
                 // One failing title doesn't stop the others; whatever has no app on the TV is not downloaded.
                 int failures = 0, tried = 0;
@@ -287,9 +340,17 @@ final class Recs {
                 failedAt = System.currentTimeMillis();
                 AppLog.w("recommendations: " + error);
             } finally {
-                fetching = false;
-                writeStatus();
-                notifyListeners();
+                boolean again;
+                synchronized (this) {
+                    fetching = false;
+                    again = refreshAgain;
+                    refreshAgain = false;
+                }
+                if (notify) {
+                    writeStatus();
+                    notifyListeners();
+                }
+                if (again) refreshIfStale();
             }
         });
     }
@@ -369,7 +430,14 @@ final class Recs {
         List<Pick> out = new ArrayList<>();
         java.util.Set<String> seen = new java.util.HashSet<>();
         for (String kind : new String[] {null, "movie", "tv"}) {
-            for (Pick p : now(kind)) if (seen.add(key(p))) out.add(p);
+            for (Pick p : now(kind)) if (seen.add(key(p) + ":" + p.app)) out.add(p);
+        }
+        if (activeApp != null) {
+            List<Pick> appPicks = nowForApp(activeApp);
+            for (int i = activeStart; i < Math.min(appPicks.size(), activeStart + 3); i++) {
+                Pick p = appPicks.get(i);
+                if (seen.add(key(p) + ":" + p.app)) out.add(p);
+            }
         }
         return out;
     }
@@ -389,6 +457,8 @@ final class Recs {
         // None of the services we know is on the TV (or hide_services hides them all): no region would change that.
         boolean any = false;
         for (String[] s : SERVICES) any |= installed(s[2]);
+        if (!any) for (HomeApps.Item item : HomeApps.shelf(context, false))
+            any |= item.kind == HomeApps.APP && item.pkg != null && installed(item.pkg);
         if (!any) throw new IOException(NO_KNOWN_APPS);
         // The services the TV has, by their TMDB ids in your region.
         Map<Integer, String[]> services = new HashMap<>();
@@ -401,7 +471,7 @@ final class Recs {
         if (services.isEmpty()) throw new IOException(NO_APPS);
         StringBuilder ids = new StringBuilder();
         for (int id : services.keySet()) ids.append(ids.length() == 0 ? "" : "|").append(id);
-        String common = "&language=" + lang() + "&watch_region=" + REGION + "&with_watch_monetization_types=flatrate&include_adult=false"
+        String common = "&language=" + lang() + "&watch_region=" + REGION + "&with_watch_monetization_types=flatrate|free|ads&include_adult=false"
                 + "&sort_by=popularity.desc&with_watch_providers=" + URLEncoder.encode(ids.toString(), "UTF-8")
                 + (Config.HIDE_ANIMATION ? "&without_genres=" + ANIMATION : "");
         // 1. Trending this week (TMDB goes by what people are watching and searching for right now), only what is
@@ -410,14 +480,18 @@ final class Recs {
         for (String kind : new String[] {"movie", "tv"}) {
             JSONArray hot = get("/trending/" + kind + "/week?language=" + lang()).getJSONArray("results");
             List<Pick> candidates = new ArrayList<>();
-            for (int i = 0; i < hot.length() && i < 20; i++) add(candidates, hot.getJSONObject(i), kind);
+            for (int i = 0; i < hot.length() && i < 10; i++) add(candidates, hot.getJSONObject(i), kind);
             for (Pick pick : candidates) {
                 try {
                     fetchDetails(pick);
                 } catch (Exception e) {
                     continue;
                 }
-                if (pick.pkg != null) (kind.equals("movie") ? hotMovies : hotShows).add(pick);
+                if (pick.pkg != null) {
+                    List<Pick> hotForKind = kind.equals("movie") ? hotMovies : hotShows;
+                    hotForKind.add(pick);
+                    if (hotForKind.size() >= 3) break;
+                }
             }
         }
         // 2. Recent releases on the TV's services: movies from the past year and shows with a new episode in the
@@ -434,6 +508,40 @@ final class Recs {
         java.util.Set<String> seen = new java.util.HashSet<>();
         alternate(list, seen, hotMovies, hotShows, 24);
         alternate(list, seen, newMovies, newShows, 24);
+        // Keep three app-specific picks for every recognized, installed shelf service. Querying each provider
+        // separately ensures an item shared by several services is attributed to the app the viewer selected.
+        for (Map.Entry<Integer, String[]> entry : services.entrySet()) {
+            int providerId = entry.getKey();
+            String[] service = entry.getValue();
+            String providerFilter = "&language=" + lang() + "&watch_region=" + REGION
+                    + "&with_watch_monetization_types=flatrate|free|ads&include_adult=false&sort_by=popularity.desc"
+                    + "&with_watch_providers=" + providerId
+                    + (Config.HIDE_ANIMATION ? "&without_genres=" + ANIMATION : "");
+            for (String kind : new String[] {"movie", "tv"}) {
+                String dateKey = kind.equals("movie") ? "primary_release_date" : "air_date";
+                int days = kind.equals("movie") ? -365 : -90;
+                String path = kind.equals("movie") ? "/discover/movie?vote_count.gte=10&" : "/discover/tv?vote_count.gte=10&";
+                JSONArray results = get(path + dateKey + ".gte=" + day(days) + "&" + dateKey + ".lte=" + day(0)
+                        + providerFilter).getJSONArray("results");
+                int added = 0;
+                for (int i = 0; i < results.length() && added < 5; i++) {
+                    JSONObject result = results.getJSONObject(i);
+                    String key = kind + ":" + result.optInt("id");
+                    String appPickKey = key + ":" + service[1];
+                    if (seen.contains(appPickKey)) continue;
+                    List<Pick> one = new ArrayList<>();
+                    add(one, result, kind);
+                    if (one.isEmpty()) continue;
+                    Pick pick = one.get(0);
+                    pick.app = service[1];
+                    pick.appName = service.length > 3 ? service[3] : SERVICE_NAME.get(service[1]);
+                    pick.pkg = service[2];
+                    list.add(pick);
+                    seen.add(appPickKey);
+                    added++;
+                }
+            }
+        }
         if (list.isEmpty()) throw new IOException("TMDB returned no recommendations");
         picks = list;
         period = p;
@@ -515,7 +623,7 @@ final class Recs {
                 p.pkg = s[2];
             }
         }
-        if (p.app != null) parts.add(SERVICE_NAME.get(p.app));
+        if (p.app != null) parts.add(p.appName == null ? SERVICE_NAME.get(p.app) : p.appName);
         p.meta = String.join(" · ", parts);
         p.detailed = true;
     }
@@ -584,7 +692,19 @@ final class Recs {
             if (installed(s[2])) return s;
             if (first == null) first = s;
         }
+        // Also recognize services added to the home shelf later. TMDB's provider name must match the TV app label.
+        String normalized = normalizeProvider(name);
+        for (HomeApps.Item item : HomeApps.shelf(context, false)) {
+            if (item.kind != HomeApps.APP || item.pkg == null || !installed(item.pkg)) continue;
+            String label = normalizeProvider(item.label);
+            if (!label.isEmpty() && (normalized.equals(label) || normalized.contains(label) || label.contains(normalized)))
+                return new String[] {name.toLowerCase(Locale.ROOT), item.key, item.pkg, item.label};
+        }
         return first;
+    }
+
+    private static String normalizeProvider(String name) {
+        return name == null ? "" : name.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]", "");
     }
 
     /** Services named in hide_services (config.properties), trimmed and lowercased: never a source of picks. */
@@ -599,12 +719,22 @@ final class Recs {
     /** The service's app is on the TV, and the service isn't hidden (an app the TV ships without a subscription, say). */
     private boolean installed(String pkg) {
         if (!HIDDEN.isEmpty()) for (String[] s : SERVICES) if (s[2].equals(pkg) && HIDDEN.contains(s[1])) return false;
-        return HomeApps.launchIntent(context.getPackageManager(), pkg) != null;
+        boolean present = HomeApps.launchIntent(context.getPackageManager(), pkg) != null;
+        installedSnapshot.put(pkg, present);
+        return present;
+    }
+
+    private boolean installedForDisplay(String pkg) {
+        if (!HIDDEN.isEmpty()) for (String[] s : SERVICES) if (s[2].equals(pkg) && HIDDEN.contains(s[1])) return false;
+        // Until the background scan completes, keep cached recommendations visible instead of stalling navigation.
+        return installedSnapshot.getOrDefault(pkg, true);
     }
 
     private long sourceStamp() {
         long stamp = (Config.TMDB_KEY.hashCode() * 31L + REGION.hashCode()) * 31L + (Config.HIDE_ANIMATION ? 1 : 0);
         for (String[] service : SERVICES) stamp = stamp * 31L + (installed(service[2]) ? service[2].hashCode() : 0);
+        for (HomeApps.Item item : HomeApps.shelf(context, false))
+            stamp = stamp * 31L + (item.pkg != null && installed(item.pkg) ? item.key.hashCode() : 0);
         return stamp;
     }
 
@@ -700,30 +830,39 @@ final class Recs {
         return key.isEmpty() ? null : key;
     }
 
-    // MARK: - Images (TMDB originals on disk, up to 24 so the whole list fits; this hour's kept ready in memory)
+    // MARK: - Images (TMDB originals on disk, with visible card art kept ready in memory)
 
     private void download(Pick p) throws IOException {
         File f = imageFile(p);
-        if (f.exists()) return;
-        //noinspection ResultOfMethodCallIgnored
-        f.getParentFile().mkdirs();
-        File part = new File(f.getPath() + ".part");
-        HttpURLConnection c = (HttpURLConnection) new URL(IMAGES + p.backdrop).openConnection();
-        c.setConnectTimeout(8000);
-        c.setReadTimeout(20000);
-        try (InputStream in = c.getInputStream(); FileOutputStream out = new FileOutputStream(part)) {
-            byte[] buffer = new byte[16384];
-            int n;
-            while ((n = in.read(buffer)) > 0) out.write(buffer, 0, n);
-        } catch (IOException e) {
-            //noinspection ResultOfMethodCallIgnored
-            part.delete();
-            throw e;
-        } finally {
-            c.disconnect();
+        Object lock;
+        synchronized (downloadLocks) {
+            lock = downloadLocks.computeIfAbsent(f.getPath(), ignored -> new Object());
         }
-        if (!part.renameTo(f)) throw new IOException("couldn't save the image");
-        prune(f.getParentFile());
+        synchronized (lock) {
+            if (f.exists()) {
+                f.setLastModified(System.currentTimeMillis());
+                return;
+            }
+            //noinspection ResultOfMethodCallIgnored
+            f.getParentFile().mkdirs();
+            File part = new File(f.getPath() + ".part");
+            HttpURLConnection c = (HttpURLConnection) new URL(IMAGES + p.backdrop).openConnection();
+            c.setConnectTimeout(8000);
+            c.setReadTimeout(20000);
+            try (InputStream in = c.getInputStream(); FileOutputStream out = new FileOutputStream(part)) {
+                byte[] buffer = new byte[16384];
+                int n;
+                while ((n = in.read(buffer)) > 0) out.write(buffer, 0, n);
+            } catch (IOException e) {
+                //noinspection ResultOfMethodCallIgnored
+                part.delete();
+                throw e;
+            } finally {
+                c.disconnect();
+            }
+            if (!part.renameTo(f)) throw new IOException("couldn't save the image");
+            prune(f.getParentFile());
+        }
     }
 
     /** Reads the photo (≥ the UI's width) and builds the backdrop (Backdrop: cards plus frosted and glass versions). */
@@ -748,7 +887,7 @@ final class Recs {
             if (forLight != light) return;   // the design changed midway: this one is stale
             synchronized (images) {
                 images.put(p.backdrop, backdrop);
-                while (images.size() > (forLight ? 10 : 4)) images.remove(images.keySet().iterator().next());
+                while (images.size() > (forLight ? 12 : 4)) images.remove(images.keySet().iterator().next());
             }
             notifyListeners();
         } catch (IOException | RuntimeException | OutOfMemoryError e) {
@@ -759,11 +898,9 @@ final class Recs {
     }
 
     void trim() {
-        // Explore's picks stay: the home screen opens on that tab, so its cards are never gray when you come back.
-        java.util.Set<String> keep = new java.util.HashSet<>();
-        for (Pick p : now(null)) if (p.backdrop != null) keep.add(p.backdrop);
+        // Keep the three most recently drawn cards. On resume, the selected app's art remains ready in memory.
         synchronized (images) {
-            images.keySet().retainAll(keep);
+            while (images.size() > 3) images.remove(images.keySet().iterator().next());
         }
     }
 
@@ -776,9 +913,9 @@ final class Recs {
             if (parts[i].lastModified() < stale) parts[i].delete();
         }
         File[] files = dir.listFiles((d, name) -> !name.endsWith(".part"));
-        if (files == null || files.length <= 24) return;
+        if (files == null || files.length <= 48) return;
         Arrays.sort(files, (a, b) -> Long.compare(a.lastModified(), b.lastModified()));
-        for (int i = 0; i < files.length - 24; i++) {
+        for (int i = 0; i < files.length - 48; i++) {
             //noinspection ResultOfMethodCallIgnored
             files[i].delete();
         }
@@ -791,7 +928,8 @@ final class Recs {
             JSONArray a = new JSONArray();
             for (Pick p : picks) {
                 a.put(new JSONObject().put("id", p.id).put("kind", p.kind).put("title", p.title).put("backdrop", p.backdrop).put("link", p.link == null ? "" : p.link)
-                        .put("meta", p.meta).put("app", p.app == null ? "" : p.app).put("pkg", p.pkg == null ? "" : p.pkg)
+                        .put("meta", p.meta).put("app", p.app == null ? "" : p.app)
+                        .put("appName", p.appName == null ? "" : p.appName).put("pkg", p.pkg == null ? "" : p.pkg)
                         .put("detailed", p.detailed));
             }
             SharedPreferences.Editor e = cache.edit().putString("picks", a.toString()).putInt("period", period).putLong("listAt", listAt)
@@ -819,6 +957,7 @@ final class Recs {
             p.link = o.optString("link").isEmpty() ? null : o.optString("link");
             p.meta = o.optString("meta");
             p.app = o.optString("app").isEmpty() ? null : o.optString("app");
+            p.appName = o.optString("appName").isEmpty() ? null : o.optString("appName");
             p.pkg = o.optString("pkg").isEmpty() ? null : o.optString("pkg");
             p.detailed = o.optBoolean("detailed");
             out.add(p);
