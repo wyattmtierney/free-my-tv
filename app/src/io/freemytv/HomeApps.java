@@ -149,6 +149,9 @@ final class HomeApps {
 
     private static String[] known(String pkg) {
         for (String[] d : SHELF) if (d[2].equals(pkg)) return d;
+        // Apple TV is user-added on this launcher, but recommendations use the stable service key "appletv".
+        if ("com.apple.atve.androidtv.appletv".equals(pkg) || "com.apple.atve.sony.appletv".equals(pkg))
+            return new String[] {"appletv", "Apple TV", pkg, "000000", "", "1"};
         return null;
     }
 
