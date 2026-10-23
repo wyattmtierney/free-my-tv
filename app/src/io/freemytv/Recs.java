@@ -4,6 +4,7 @@ import android.content.Context;
 import android.content.SharedPreferences;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.net.Uri;
 import android.os.Handler;
 import android.os.Looper;
 
@@ -151,6 +152,16 @@ final class Recs {
             keyStamp = cache.getLong("keyStamp", 0);
         } catch (Exception ignored) {
         }
+        SharedPreferences.Editor cleanLinks = cache.edit();
+        boolean removedLink = false;
+        for (Pick pick : picks) {
+            if (pick.link != null && !providerLinkMatches(pick.app, pick.link)) {
+                pick.link = null;
+                cleanLinks.remove(linkKey(pick));
+                removedLink = true;
+            }
+        }
+        if (removedLink) cleanLinks.apply();
     }
 
     void addListener(Listener l) { if (!listeners.contains(l)) listeners.add(l); }
@@ -745,8 +756,10 @@ final class Recs {
     }
 
     private boolean needsLink(Pick p) {
-        return linksOn() && p.pkg != null && p.link == null
-                && cache.getString(linkKey(p), null) == null && System.currentTimeMillis() >= linkRetryAt;
+        if (!linksOn() || p.pkg == null || System.currentTimeMillis() < linkRetryAt) return false;
+        if (p.link != null && providerLinkMatches(p.app, p.link)) return false;
+        String saved = cache.getString(linkKey(p), null);
+        return saved == null || (!saved.isEmpty() && !providerLinkMatches(p.app, saved));
     }
 
     /** A key is set and Watchmode hasn't refused it (a refused key isn't tried again until it changes). */
@@ -757,13 +770,18 @@ final class Recs {
 
     /** Sets p.link from what was looked up before, or looks it up (2 requests of the free plan's 2,500 a month). */
     private void findLink(Pick p) {
-        if (!linksOn() || p.pkg == null || p.link != null) return;
+        if (!linksOn() || p.pkg == null || System.currentTimeMillis() < linkRetryAt) return;
+        if (p.link != null && providerLinkMatches(p.app, p.link)) return;
         String saved = cache.getString(linkKey(p), null);
         if (saved != null) {
-            p.link = saved.isEmpty() ? null : saved;
-            return;
+            if (saved.isEmpty() || providerLinkMatches(p.app, saved)) {
+                p.link = saved.isEmpty() ? null : saved;
+                return;
+            }
+            // A previous lookup matched a channel with the same provider name but linked to a different app.
+            cache.edit().remove(linkKey(p)).apply();
         }
-        if (System.currentTimeMillis() < linkRetryAt) return;
+        p.link = null;
         try {
             String link = "";
             JSONArray found = new JSONObject(watchmode("/search/?search_field=tmdb_" + p.kind + "_id&search_value=" + p.id))
@@ -776,8 +794,10 @@ final class Recs {
                     JSONObject s = sources.getJSONObject(i);
                     String name = s.optString("name").toLowerCase(Locale.ROOT).replace(" ", "");
                     String want = service[0].replace(" ", "");
+                    String url = s.optString("web_url");
                     boolean same = want.equals("max") ? name.equals("max") : name.contains(want);
-                    if (same && s.optString("type").equals("sub") && s.optString("web_url").startsWith("https://")) link = s.optString("web_url");
+                    if (same && s.optString("type").equals("sub") && url.startsWith("https://")
+                            && providerLinkMatches(p.app, url)) link = url;
                 }
             }
             cache.edit().putString(linkKey(p), link).apply();
@@ -789,6 +809,27 @@ final class Recs {
             linkRetryAt = System.currentTimeMillis() + 10 * 60_000L;   // quota or network: not again right away
             AppLog.w("watchmode: " + e.getMessage());
         }
+    }
+
+    /** Reject channel URLs that belong to a different streaming app than the recommendation's shelf service. */
+    private static boolean providerLinkMatches(String app, String url) {
+        String domain;
+        switch (app == null ? "" : app) {
+            case "netflix": domain = "netflix.com"; break;
+            case "prime": domain = "primevideo.com"; break;
+            case "disney": domain = "disneyplus.com"; break;
+            case "crave": domain = "crave.ca"; break;
+            case "tubi": domain = "tubitv.com"; break;
+            case "youtube": domain = "youtube.com"; break;
+            case "appletv": domain = "tv.apple.com"; break;
+            case "max": domain = "max.com"; break;
+            case "hulu": domain = "hulu.com"; break;
+            case "paramount": domain = "paramountplus.com"; break;
+            case "peacock": domain = "peacocktv.com"; break;
+            default: return true;     // custom shelf apps have no known web domain
+        }
+        String host = Uri.parse(url).getHost();
+        return host != null && (host.equalsIgnoreCase(domain) || host.toLowerCase(Locale.ROOT).endsWith("." + domain));
     }
 
     private static String watchmode(String path) throws IOException {
