@@ -54,8 +54,15 @@ final class SportsScores {
             if (state.equals("LIVE")) return key + " " + score + " vs " + opponent + " (" + detail + ")";
             if (state.equals("FINAL")) return key + " " + score + " vs " + opponent + " (Final)";
             if (state.equals("UP NEXT")) return key + " vs " + opponent + " (" + detail + ")"
-                    + (odds.isEmpty() ? "" : ", moneyline " + odds);
+                    + (odds.isEmpty() ? "" : ", " + oddsText());
             return key + ": " + detail;
+        }
+
+        String oddsText() {
+            if (odds.isEmpty()) return "";
+            String abbreviation = key.equals("Raptors") ? "TOR" : key.equals("Canucks") || key.equals("Whitecaps") ? "VAN"
+                    : key.equals("BC Lions") ? "BC" : key.toUpperCase(Locale.ROOT);
+            return abbreviation + " " + odds;
         }
 
         JSONObject json() {
@@ -94,7 +101,7 @@ final class SportsScores {
 
     private SportsScores(Context context) {
         // v3 discards the first draft's unparseable schedule cache, which could leave every team at "No game".
-        cache = context.getSharedPreferences("sports-scores-v3", Context.MODE_PRIVATE);
+        cache = context.getSharedPreferences("sports-scores-v4", Context.MODE_PRIVATE);
         updatedAt = cache.getLong("updatedAt", 0);
         try {
             JSONArray a = new JSONArray(cache.getString("games", "[]"));
@@ -242,7 +249,7 @@ final class SportsScores {
             }
         }
         if (ownPrices.isEmpty() || otherPrices.isEmpty()) return "";
-        return american(median(ownPrices)) + " / " + american(median(otherPrices));
+        return american(median(ownPrices));
     }
 
     private static String normalized(String s) { return s.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]", ""); }
