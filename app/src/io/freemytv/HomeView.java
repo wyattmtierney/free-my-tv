@@ -1756,6 +1756,8 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
 
             String value = game == null ? "—" : (game.state.equals("LIVE") || game.state.equals("FINAL") ? game.score : game.state);
             String detail = game == null ? "" : game.detail;
+            if (game != null && game.state.equals("UP NEXT") && !game.odds.isEmpty())
+                detail = "US median ML " + game.odds + " · " + detail;
             sportsScorePaint.setColor(drawerInk(0.98f));
             sportsScorePaint.setTextAlign(Paint.Align.RIGHT);
             c.drawText(value, r.right - 26 * k, y + 24 * k, sportsScorePaint);
@@ -3033,6 +3035,7 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
                     : game.state.equals("LIVE") ? "LIVE · " + game.detail
                     : game.state.equals("FINAL") ? "FINAL · " + game.opponent
                     : game.detail;
+            if (game != null && game.state.equals("UP NEXT") && !game.odds.isEmpty()) detail = "US median ML " + game.odds;
             sportsScorePaint.setTextSize(15 * k);
             sportsScorePaint.setTextAlign(Paint.Align.LEFT);
             sportsScorePaint.setColor(Ui.alpha(game != null && game.state.equals("LIVE") ? 0xFFFF5B52 : 0xFFFFFFFF, fade));

@@ -32,22 +32,29 @@ final class SportsScores {
     interface Listener { void onScores(); }
 
     static final class Game {
-        final String key, opponent, score, state, detail;
-        final long start;
+        final String key, opponent, score, state, detail, odds;
+        final long start, oddsUpdatedAt;
 
         Game(String key, String opponent, String score, String state, String detail, long start) {
+            this(key, opponent, score, state, detail, start, "", 0);
+        }
+
+        Game(String key, String opponent, String score, String state, String detail, long start, String odds, long oddsUpdatedAt) {
             this.key = key;
             this.opponent = opponent;
             this.score = score;
             this.state = state;
             this.detail = detail;
             this.start = start;
+            this.odds = odds == null ? "" : odds;
+            this.oddsUpdatedAt = oddsUpdatedAt;
         }
 
         String summary() {
             if (state.equals("LIVE")) return key + " " + score + " vs " + opponent + " (" + detail + ")";
             if (state.equals("FINAL")) return key + " " + score + " vs " + opponent + " (Final)";
-            if (state.equals("UP NEXT")) return key + " vs " + opponent + " (" + detail + ")";
+            if (state.equals("UP NEXT")) return key + " vs " + opponent + " (" + detail + ")"
+                    + (odds.isEmpty() ? "" : ", moneyline " + odds);
             return key + ": " + detail;
         }
 
@@ -56,6 +63,7 @@ final class SportsScores {
             try {
                 o.put("key", key); o.put("opponent", opponent); o.put("score", score);
                 o.put("state", state); o.put("detail", detail); o.put("start", start);
+                o.put("odds", odds); o.put("oddsUpdatedAt", oddsUpdatedAt);
             } catch (Exception ignored) {}
             return o;
         }
@@ -63,6 +71,9 @@ final class SportsScores {
 
     private static final String[] KEYS = {"Whitecaps", "BC Lions", "Raptors", "Canucks"};
     private static final long REFRESH_MS = 60_000L, RETRY_MS = 120_000L;
+    // Four sport requests every eight hours stays under The Odds API's 500 free monthly credits, with room to spare.
+    private static final long ODDS_REFRESH_MS = 8 * 3600_000L;
+    private static final String ODDS_API = "https://api.the-odds-api.com/v4/sports/";
     private static final String CFL_URL = "https://cflscoreboard.cfl.ca/json/scoreboard/rounds.json";
     private static SportsScores instance;
 
@@ -91,7 +102,8 @@ final class SportsScores {
             for (int i = 0; i < a.length(); i++) {
                 JSONObject o = a.getJSONObject(i);
                 loaded.add(new Game(o.optString("key"), o.optString("opponent"), o.optString("score"),
-                        o.optString("state"), o.optString("detail"), o.optLong("start")));
+                        o.optString("state"), o.optString("detail"), o.optLong("start"),
+                        o.optString("odds"), o.optLong("oddsUpdatedAt")));
             }
             if (!loaded.isEmpty()) games = loaded;
         } catch (Exception ignored) {}
@@ -119,6 +131,21 @@ final class SportsScores {
                 next.add(await(lions, "BC Lions"));
                 next.add(await(raptors, "Raptors"));
                 next.add(await(canucks, "Canucks"));
+                boolean oddsDue = !Config.ODDS_API_KEY.trim().isEmpty()
+                        && (now - cache.getLong("oddsAt", 0) >= ODDS_REFRESH_MS || now < cache.getLong("oddsAt", 0));
+                if (oddsDue) {
+                    Future<String> whitecapsOdds = io.submit(() -> oddsSafely(next.get(0), "soccer_usa_mls", "Vancouver Whitecaps"));
+                    Future<String> lionsOdds = io.submit(() -> oddsSafely(next.get(1), "americanfootball_cfl", "BC Lions"));
+                    Future<String> raptorsOdds = io.submit(() -> oddsSafely(next.get(2), "basketball_nba", "Toronto Raptors"));
+                    Future<String> canucksOdds = io.submit(() -> oddsSafely(next.get(3), "icehockey_nhl", "Vancouver Canucks"));
+                    next.set(0, withOdds(next.get(0), awaitOdds(whitecapsOdds), now));
+                    next.set(1, withOdds(next.get(1), awaitOdds(lionsOdds), now));
+                    next.set(2, withOdds(next.get(2), awaitOdds(raptorsOdds), now));
+                    next.set(3, withOdds(next.get(3), awaitOdds(canucksOdds), now));
+                    cache.edit().putLong("oddsAt", now).apply();
+                } else {
+                    for (int i = 0; i < next.size(); i++) next.set(i, retainOdds(next.get(i), game(next.get(i).key)));
+                }
                 boolean hasError = false;
                 for (Game game : next) if (game.state.equals("UNAVAILABLE")) hasError = true;
                 games = next;
@@ -144,6 +171,93 @@ final class SportsScores {
             AppLog.w("scores " + key + " timed out: " + e.getClass().getSimpleName());
             return new Game(key, "", "—", "UNAVAILABLE", "Score feed timed out", 0);
         }
+    }
+
+    private static String awaitOdds(Future<String> future) {
+        try { return future.get(12, TimeUnit.SECONDS); }
+        catch (Exception e) { future.cancel(true); return ""; }
+    }
+
+    private static Game withOdds(Game game, String odds, long at) {
+        Game old = instance == null ? null : instance.game(game.key);
+        if (odds == null || odds.isEmpty()) return retainOdds(game, old);
+        return new Game(game.key, game.opponent, game.score, game.state, game.detail, game.start, odds, at);
+    }
+
+    private static Game retainOdds(Game game, Game old) {
+        if (old == null || old.start != game.start || !old.opponent.equals(game.opponent) || old.odds.isEmpty()) return game;
+        return new Game(game.key, game.opponent, game.score, game.state, game.detail, game.start, old.odds, old.oddsUpdatedAt);
+    }
+
+    private static String oddsSafely(Game game, String sport, String teamName) {
+        try { return fetchOdds(game, sport, teamName); }
+        catch (Exception e) {
+            AppLog.w("odds " + game.key + " unavailable: " + e.getClass().getSimpleName());
+            return "";
+        }
+    }
+
+    /** One consensus moneyline pair for the team's next scheduled game. */
+    private static String fetchOdds(Game game, String sport, String teamName) throws Exception {
+        long now = System.currentTimeMillis();
+        if (!game.state.equals("UP NEXT") || game.start <= now) return "";
+        String url = ODDS_API + sport + "/odds?apiKey=" + java.net.URLEncoder.encode(Config.ODDS_API_KEY.trim(), "UTF-8")
+                + "&regions=us&markets=h2h&oddsFormat=american&dateFormat=iso";
+        JSONArray events = new JSONArray(get(url));
+        JSONObject selected = null;
+        long bestDelta = Long.MAX_VALUE;
+        String target = normalized(teamName);
+        for (int i = 0; i < events.length(); i++) {
+            JSONObject event = events.optJSONObject(i);
+            if (event == null) continue;
+            String home = event.optString("home_team"), away = event.optString("away_team");
+            if (!matchesTeam(target, home) && !matchesTeam(target, away)) continue;
+            long start = parseDate(event.optString("commence_time"));
+            long delta = Math.abs(start - game.start);
+            if (start > 0 && delta < bestDelta && delta <= 6 * 3600_000L) {
+                selected = event;
+                bestDelta = delta;
+            }
+        }
+        if (selected == null) return "";
+        String home = selected.optString("home_team"), away = selected.optString("away_team");
+        String ownName = matchesTeam(target, home) ? home : away;
+        String otherName = ownName.equals(home) ? away : home;
+        List<Double> ownPrices = new ArrayList<>(), otherPrices = new ArrayList<>();
+        JSONArray books = selected.optJSONArray("bookmakers");
+        for (int i = 0; books != null && i < books.length(); i++) {
+            JSONObject book = books.optJSONObject(i);
+            JSONArray markets = book == null ? null : book.optJSONArray("markets");
+            for (int j = 0; markets != null && j < markets.length(); j++) {
+                JSONObject market = markets.optJSONObject(j);
+                if (market == null || !"h2h".equals(market.optString("key"))) continue;
+                JSONArray outcomes = market.optJSONArray("outcomes");
+                for (int k = 0; outcomes != null && k < outcomes.length(); k++) {
+                    JSONObject outcome = outcomes.optJSONObject(k);
+                    if (outcome == null || !outcome.has("price")) continue;
+                    String name = outcome.optString("name");
+                    if (name.equalsIgnoreCase(ownName)) ownPrices.add(outcome.optDouble("price"));
+                    else if (name.equalsIgnoreCase(otherName)) otherPrices.add(outcome.optDouble("price"));
+                }
+            }
+        }
+        if (ownPrices.isEmpty() || otherPrices.isEmpty()) return "";
+        return american(median(ownPrices)) + " / " + american(median(otherPrices));
+    }
+
+    private static String normalized(String s) { return s.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]", ""); }
+    private static boolean matchesTeam(String target, String candidate) {
+        if (target.isEmpty() || candidate == null || candidate.isEmpty()) return false;
+        String value = normalized(candidate);
+        return value.equals(target) || value.contains(target) || target.contains(value);
+    }
+    private static double median(List<Double> values) {
+        Collections.sort(values);
+        int middle = values.size() / 2;
+        return values.size() % 2 == 0 ? (values.get(middle - 1) + values.get(middle)) / 2 : values.get(middle);
+    }
+    private static String american(double value) {
+        return (value > 0 ? "+" : "") + String.format(Locale.US, "%.0f", value);
     }
 
     private static Game fetchSafely(String key, GameFetch fetch) {

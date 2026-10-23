@@ -109,6 +109,7 @@ The first values come from `config.properties`, created by the first build (Goog
 | `tmdb_key` | Your free TMDB key, for the picks | empty |
 | `tmdb_region` | Your country (two letters): which titles are on which app | `US` |
 | `watchmode_key` | Optional, free [Watchmode](https://api.watchmode.com/) key: a pick opens the title's page in its app | empty |
+| `odds_api_key` | Optional, free [The Odds API](https://the-odds-api.com/) key: shows US market moneyline odds for the next Whitecaps, BC Lions, Raptors and Canucks games | empty |
 | `latitude`, `longitude` | Your city, for the weather and the sunset | New York |
 | `city` | The name on the weather card | `Weather` |
 | `hide_animation` | Leave cartoons and anime out of the picks | `false` |
@@ -129,6 +130,8 @@ Free, and it takes two minutes: create an account at [themoviedb.org](https://ww
 ### Opening a title, not just its app (optional)
 
 With a free [Watchmode](https://api.watchmode.com/) key (`watchmode_key=` in `config.properties`), a pick opens its own page in the streaming app instead of the app's home. The free plan (2,500 credits a month) is enough: each title costs two requests the first time and is remembered after that. It works where the app takes the title's web address (tested: Prime Video and JioHotstar); where it doesn't, the pick just opens the app, as without a key.
+
+With a free [The Odds API](https://the-odds-api.com/) key (`odds_api_key=` in `config.properties`), the sports widget shows US-market median moneyline odds for each team's next scheduled game when available. The app checks odds every eight hours and only queries leagues with an upcoming game. The free plan has 500 credits per month; one league request costs one credit for one market and region. Keep the key private: it is included in the APK when configured.
 
 ## Going back
 
@@ -229,7 +232,7 @@ reference (fix them by hand); the others were machine-made, and corrections from
 
 ## Privacy
 
-No accounts, no analytics, no tracking. The app talks to TMDB, Open-Meteo (with the coordinates you set, or your time zone's main city), and Binance only when `show_crypto=true`, and Watchmode only when you set a `watchmode_key`. Your settings stay on your computer and your TV.
+No accounts, no analytics, no tracking. The app talks to TMDB, Open-Meteo (with the coordinates you set, or your time zone's main city), Binance only when `show_crypto=true`, Watchmode only when you set a `watchmode_key`, and The Odds API only when you set an `odds_api_key`. Your settings stay on your computer and your TV.
 
 ## Credits
 
